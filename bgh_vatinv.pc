@@ -1,0 +1,241 @@
+/**************************************************************************************************
+ *                                                                                          
+ * MODULE: BGH_VATINV
+ *                                                                                          
+ * AUTHOR: N.Bondarczuk                                                
+ * 
+ * CREATION DATE : 14.02.2000
+ *
+ **************************************************************************************************
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>             /* used for strncmp          */
+#include <time.h>               /* time information          */
+
+#define SQLCA_STORAGE_CLASS extern
+#define ORACA_STORAGE_CLASS extern
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL INCLUDE oraca;
+EXEC ORACLE OPTION (INCLUDE=./include);
+
+#include "bgh.h"
+#include "protos.h"
+#include "bgh_esql.h"
+#include "bgh_transx.h"
+#include "timm.h"
+
+/*
+ * VARCHAR handling
+ */
+
+#define STRCPY_TO_ORA(dest, source)	\
+        {				\
+           (dest).len = strlen(source);	\
+           (void)memcpy((void*)(dest).arr, (void*)(source), (size_t)(dest).len); \
+	}
+#define STRCPY_FROM_ORA(dest, source)	\
+        { 				\
+          (void)memcpy((void*)(dest), (void*)(source).arr, (size_t)(source).len); \
+          (dest)[(source).len] = '\0';	\
+	}
+
+/*
+ * extern variables
+ */
+
+extern stBGHGLOB stBgh;
+extern BOOL connected;     	    /* stores status of database      */
+extern BOOL status_single;        /* status for a single customer   */
+extern long current_customer_id;
+extern long current_contract_id;
+extern char current_date_created[15];
+extern long O_ohxact;
+
+/*
+ * static variables
+ */
+
+static char message[MAX_BUF];
+
+EXEC SQL BEGIN DECLARE SECTION;
+
+extern VARCHAR O_db_name[50];
+
+EXEC SQL END DECLARE SECTION;
+
+static void sqlerror(
+                     int code,         /* self-defined error-code   */
+                     char *occurrence  /* location where the error  */
+                     )                  /* occurred and additional   */  
+#define MAX_SQL_MESSAGE 512
+{
+/* These vars are only used to get the oracle long-message   */
+   char message_buf[ MAX_SQL_MESSAGE + 1];
+   size_t buf_len = MAX_SQL_MESSAGE;
+   size_t msg_len;
+
+   if (sqlca.sqlcode < 0) {
+     /* to get the oracle long-message */
+     sqlglm (message_buf , &buf_len, &msg_len); /* sqlglm is a ORACLE function */
+     message_buf[msg_len] = '\0';
+#if 0
+     sprintf(message_buf, "%s%s\n%s%d\n%s%ld\n%s%s\n%s%s\n%s",
+	     "SQL-ERROR in file: ", __FILE__,
+	     "Module ERROR-code: ", code,
+	     "SQL-code:          ", sqlca.sqlcode,
+	     "Description:       ", occurrence,
+	     "SQL-Short message: ", sqlca.sqlerrm.sqlerrmc,
+	     "SQL-Full message: ");
+#else
+     sprintf(message, "%s%s\n%s%d\n%s%ld\n%s%s\n%s%s",
+	     "SQL-ERROR in file: ", __FILE__,
+	     "Module ERROR-code: ", code,
+	     "SQL-code:          ", sqlca.sqlcode,
+	     "Description:       ", occurrence,
+	     "SQL-Full message:  ", message_buf);
+#endif
+     macErrorMessage (code, WARNING, message);
+   }
+}
+
+/**********************************************************************************************************************
+ *
+ * foiVatInv_InsertOtEntry
+ *
+ **********************************************************************************************************************
+ */
+
+int foiVatInv_InsertOtEntry(struct tostOtEntry *ppstOhEntry)
+{
+  int rc = 0;
+  static char laszPattern[256];
+  
+  if (O_ohxact > 0)
+    {
+      EXEC SQL BEGIN DECLARE SECTION;
+      
+      unsigned int O_otseq;
+      double O_netamt;
+      double O_disamt;
+      
+      EXEC SQL END DECLARE SECTION;
+
+      O_otseq = ppstOhEntry->soiOtSeq;
+      O_netamt = ppstOhEntry->soflOtNet;
+      O_disamt = ppstOhEntry->soflOtDis;
+      
+      strcpy(laszPattern,"Inserting to EDS_VATINVOTR:\n");
+      strcat(laszPattern, "OHXACT    : %ld\n");
+      strcat(laszPattern, "OTSEQ     : %ld\n");      
+      strcat(laszPattern, "NETAMT    : %16.8lf\n");      
+      strcat(laszPattern, "DISAMT    : %16.8lf\n");            
+
+      fovdPrintLog(LOG_DEBUG, laszPattern,
+                   O_ohxact,
+                   O_otseq,
+                   O_netamt,
+                   O_disamt);
+
+      EXEC SQL AT :O_db_name
+        INSERT INTO EDS_VATINVOTR
+        (OTXACT, OTSEQ, NETAMT, DISAMT, REC_VERSION)
+        VALUES 
+        (:O_ohxact, 
+         :O_otseq,
+         :O_netamt,
+         :O_disamt,
+         0);
+      
+      if (sqlca.sqlcode != 0)
+        {      
+          rc = -1;
+          sqlerror(rc, "Can't insert to EDS_VATINVOTR");
+        }
+    }
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiVatInv_InsertTax
+ *
+ **********************************************************************************************************************
+ */
+
+int foiVatInv_InsertTax(double poflTaxRate,
+                        char pochTaxExempt,
+                        double poflNetAmt,                        
+                        double poflDisAmt,
+                        double poflTaxAmt,
+                        double poflTotAmt)
+{
+  int rc = 0;
+  static char laszPattern[256];
+
+  if (O_ohxact > 0)
+    {
+      EXEC SQL BEGIN DECLARE SECTION;
+      
+      double O_tax_rate;
+      char O_tax_exempt;
+      double O_netamt;
+      double O_disamt;
+      double O_taxamt;
+      double O_totamt;
+  
+      EXEC SQL END DECLARE SECTION;
+      
+      O_tax_rate = poflTaxRate;
+      O_tax_exempt = pochTaxExempt;
+      O_netamt = poflNetAmt;
+      O_disamt = poflDisAmt;
+      O_taxamt = poflTaxAmt;
+      O_totamt = poflTotAmt;      
+
+      strcpy(laszPattern,"Inserting to EDS_VATINVTAX:\n");
+      strcat(laszPattern, "OHXACT    : %ld\n");
+      strcat(laszPattern, "TAX_RATE  : %lf\n");
+      strcat(laszPattern, "TAX_EXEMPT: %c\n");
+      strcat(laszPattern, "NETAMT    : %lf\n");
+      strcat(laszPattern, "DISAMT    : %lf\n");
+      strcat(laszPattern, "TAXAMT    : %lf\n");
+      strcat(laszPattern, "TOTAMT    : %lf\n");
+
+      fovdPrintLog(LOG_DEBUG, laszPattern,
+                   O_ohxact,
+                   O_tax_rate,
+                   O_tax_exempt,
+                   O_netamt,
+                   O_disamt,
+                   O_taxamt,
+                   O_totamt);            
+
+      EXEC SQL AT :O_db_name
+        INSERT INTO EDS_VATINVTAX
+        (OHXACT, TAX_RATE, TAX_EXEMPT, NETAMT, DISAMT, TAXAMT, TOTAMT, REC_VERSION)
+        VALUES
+        (:O_ohxact,          
+         :O_tax_rate,
+         :O_tax_exempt,
+         :O_netamt,
+         :O_disamt,
+         :O_taxamt,
+         :O_totamt,
+         0);
+      
+      if (sqlca.sqlcode != 0)
+        {      
+          rc = -1;
+          sqlerror(rc, "Can't insert to EDS_VATINVTAX");
+        }
+    }
+  
+  return rc;
+}
+
+                        
+

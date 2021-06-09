@@ -1,0 +1,602 @@
+/**************************************************************************************************
+ *
+ * MODULE: LOYAL Pro C procedures
+ *
+ * AUTHOR: Jaroslaw Glowacki, Norbert Bondarczuk
+ *
+ * CREATION DATE : 16-05-2000
+ *
+ **************************************************************************************************
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>             /* used for strncmp          */
+#include <time.h>               /* time information          */
+
+#define SQLCA_STORAGE_CLASS extern
+#define ORACA_STORAGE_CLASS extern
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL INCLUDE oraca;
+
+#include "bgh.h"
+#include "protos.h"
+#include "types.h"
+#include "bgh_esql.h"
+#include "bgh_loyal.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+
+VARCHAR    O_db_name[50];
+
+EXEC SQL END DECLARE SECTION;
+
+#define sqlerror(rc, message) printf("Error:%04d %s\n", rc, message)
+
+/*
+ * VARCHAR handling
+ */
+
+#define STRCPY_TO_ORA(dest, source)	\
+{				\
+          (dest).len = strlen(source);	\
+          (void)memcpy((void*)(dest).arr, (void*)(source), (size_t)(dest).len); \
+}
+
+#define STRCPY_FROM_ORA(dest, source)	\
+{ 				\
+            (void)memcpy((void*)(dest), (void*)(source).arr, (size_t)(source).len); \
+            (dest)[(source).len] = '\0';	\
+}
+
+/*
+ * static variables
+ */
+
+static char message[MAX_BUF];
+
+/*
+ * functions
+ */
+
+int foiBghLoyalHdr_Insert(struct tostLoyalInvInfo *ppstInfo)
+{
+  int rc = 0;
+
+  EXEC SQL BEGIN DECLARE SECTION;
+  varchar  ora_ohrefnum [ LEN_ANYSTRING ];
+  varchar  ora_ohrefdate[ LEN_ANYSTRING ];
+  varchar  ora_custcode [ LEN_ANYSTRING ];
+  long     ora_ohxact;
+  long     ora_customer_id;
+  EXEC SQL END DECLARE SECTION;
+
+  STRCPY_TO_ORA( ora_ohrefnum,  ppstInfo->spszOhRefNum );
+  STRCPY_TO_ORA( ora_ohrefdate, ppstInfo->spszOhRefDate );
+  STRCPY_TO_ORA( ora_custcode,  ppstInfo->spszCustCode );
+  ora_customer_id =  ppstInfo->solCustId;
+  ora_ohxact = ppstInfo->solOhxact;
+  
+  fovdPrintLog (LOG_DEBUG, "insertEdsBghLoyalHdr: Inserting into EDS_BGH_LOYALHDR\n");      
+  fovdPrintLog (LOG_DEBUG, "CustCode   : %s\n", ppstInfo->spszCustCode );
+  fovdPrintLog (LOG_DEBUG, "OhRefNum   : %s\n", ppstInfo->spszOhRefNum );
+  fovdPrintLog (LOG_DEBUG, "OhRefDate  : %s\n", ppstInfo->spszOhRefDate );
+  fovdPrintLog (LOG_DEBUG, "Customer Id: %ld\n", ppstInfo->solCustId );
+  fovdPrintLog (LOG_DEBUG, "OHXACT     : %ld\n", ppstInfo->solOhxact );
+
+  if (strlen(ppstInfo->spszOhRefDate) == 8)
+    {
+      EXEC SQL AT :O_db_name
+        INSERT INTO EDS_BGH_LOYALHDR 
+        ( 
+         OHXACT,
+         OHREFNUM,
+         OHREFDATE,
+         CUSTCODE,
+         CUSTOMER_ID
+         )
+        VALUES
+        (
+         :ora_ohxact,
+         :ora_ohrefnum, 
+         to_date(:ora_ohrefdate, 'YYYYMMDD'),
+         :ora_custcode,
+         :ora_customer_id
+         );  
+    }
+  else if (strlen(ppstInfo->spszOhRefDate) == 6)
+    {
+      EXEC SQL AT :O_db_name
+        INSERT INTO EDS_BGH_LOYALHDR 
+        ( 
+         OHXACT,
+         OHREFNUM,
+         OHREFDATE,
+         CUSTCODE,
+         CUSTOMER_ID
+         )
+        VALUES
+        (
+         :ora_ohxact,
+         :ora_ohrefnum, 
+         to_date(:ora_ohrefdate, 'YYMMDD'),
+         :ora_custcode,
+         :ora_customer_id
+         );        
+    }
+  else
+    {}
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not insert into EDS_BGH_LOYALHDR");
+      sqlerror(rc, message);
+      return rc;
+    }
+   
+  return rc;
+}
+
+int foiEdsBghLoyalCo_Insert(struct tostLoyalInvInfo *ppstInvInfo,
+                            struct tostLoyalCoInfo *ppstCoInfo)
+{
+  int rc = 0;
+
+  EXEC SQL BEGIN DECLARE SECTION;
+  long     ora_ohxact;
+  long     ora_co_id;
+  short    ora_co_id_ind;
+  varchar  ora_main_msisdn [ LEN_ANYSTRING ];
+  short    ora_main_msisdn_ind;
+  EXEC SQL END DECLARE SECTION;
+
+  if (ppstCoInfo->sostCoServTree.sostSumVal.soflNetAmt == 0.0)
+    {
+      return rc;
+    }
+
+  if (ppstCoInfo->solCoId > 0)
+    {
+      ora_co_id = ppstCoInfo->solCoId;
+      ora_co_id_ind = 0;
+      STRCPY_TO_ORA(ora_main_msisdn,  ppstCoInfo->spszDnNum);
+      ora_main_msisdn_ind = 0;
+    }
+  else
+    {
+      ora_co_id = 0;
+      ora_co_id_ind = -1;
+      ora_main_msisdn_ind = -1;
+    }
+
+  ora_ohxact = ppstInvInfo->solOhxact;
+  
+  fovdPrintLog (LOG_DEBUG, "Insert: Inserting into EDS_BGH_LOYAL_CONTRACT\n");
+  fovdPrintLog (LOG_DEBUG, "OHXACT     : %ld\n", ppstInvInfo->solOhxact);
+  fovdPrintLog (LOG_DEBUG, "CO_ID      : %ld\n", ppstCoInfo->solCoId);
+  fovdPrintLog (LOG_DEBUG, "DNNUM      : %s\n", ppstCoInfo->spszDnNum);
+  
+  EXEC SQL AT :O_db_name
+    INSERT INTO EDS_BGH_LOYAL_CONTRACT 
+    ( 
+     OHXACT,
+     CO_ID,
+     MAIN_MSISDN
+     )
+    VALUES
+    (
+     :ora_ohxact,
+     :ora_co_id:ora_co_id_ind,
+     :ora_main_msisdn:ora_main_msisdn_ind
+     );  
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not insert into EDS_BGH_LOYAL_CONTRACT");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  return rc;
+}
+
+int foiEdsBghLoyalTrl_SumInsert(struct tostLoyalInvInfo *ppstInvInfo,
+                                struct tostLoyalCoInfo *ppstCoInfo,
+                                int polTypeId)
+{
+  int rc = 0;
+
+  EXEC SQL BEGIN DECLARE SECTION;
+  long ora_ohxact;
+  long ora_co_id;
+  short ora_co_id_ind;
+  long ora_amount_type_id;
+  double ora_net_amount;
+  double ora_tax_amount;
+  EXEC SQL END DECLARE SECTION;
+
+  if (ppstCoInfo == NULL)
+    {
+      ora_co_id = 0;
+      ora_co_id_ind = -1;
+      ora_net_amount = ppstInvInfo->sostDis.soflNetAmt;
+      ora_tax_amount = ppstInvInfo->sostDis.soflTaxAmt;;
+    }
+  else
+    {
+      if (ppstCoInfo->sostCoServTree.sostSumVal.soflNetAmt == 0.0)
+        {
+          return rc;
+        }
+      
+      if (ppstCoInfo->solCoId > 0)
+        {
+          ora_co_id = ppstCoInfo->solCoId;
+          ora_co_id_ind = 0;
+        }
+      else
+        {
+          ora_co_id = 0;
+          ora_co_id_ind = -1;
+        }
+
+      ora_net_amount = ppstCoInfo->sostCoServTree.sostSumVal.soflNetAmt;
+      ora_tax_amount = ppstCoInfo->sostCoServTree.sostSumVal.soflTaxAmt;      
+    }
+
+  ora_ohxact = ppstInvInfo->solOhxact;
+  ora_amount_type_id = polTypeId;
+
+  fovdPrintLog (LOG_DEBUG, "Insert: Inserting into EDS_BGH_LOYALTRAILER\n");    
+  fovdPrintLog (LOG_DEBUG, "OHXACT     : %ld\n", ora_ohxact);
+  fovdPrintLog (LOG_DEBUG, "Amount Type: %ld\n", ora_amount_type_id);
+  fovdPrintLog (LOG_DEBUG, "NetAmt     : %lf\n", ora_net_amount);
+  fovdPrintLog (LOG_DEBUG, "TaxAmt     : %lf\n", ora_tax_amount);
+
+  EXEC SQL AT :O_db_name
+    INSERT INTO EDS_BGH_LOYALTRAILER 
+    ( 
+     OHXACT,
+     CO_ID,
+     AMOUNT_TYPE_ID,
+     NET_AMOUNT,
+     TAX_AMOUNT
+     )
+    VALUES
+    (
+     :ora_ohxact,
+     :ora_co_id:ora_co_id_ind,
+     :ora_amount_type_id,
+     round(:ora_net_amount, 2),
+     round(:ora_tax_amount, 2)
+     );  
+  
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not insert into EDS_BGH_LOYALTRAILER");
+      sqlerror(rc, message);
+      return rc;
+    }
+  
+  return rc;
+}
+
+int foiEdsBghLoyalTrl_ServInsert(struct tostLoyalInvInfo *ppstInvInfo,
+                                 struct tostLoyalCoInfo *ppstCoInfo,
+                                 struct tostLoyalCoServ *ppstServ)
+{
+  int rc = 0;
+
+  EXEC SQL BEGIN DECLARE SECTION;
+  long ora_ohxact;
+  long ora_co_id;
+  short ora_co_id_ind;
+  long ora_amount_type_id;
+  double ora_net_amount;
+  double ora_tax_amount;
+  EXEC SQL END DECLARE SECTION;
+
+  if (ppstServ->sostVal.soflNetAmt == 0.0)
+    {
+      return rc;
+    }
+
+  if (ppstCoInfo->solCoId > 0)
+    {
+      ora_co_id = ppstCoInfo->solCoId;
+      ora_co_id_ind = 0;
+    }
+  else
+    {
+      ora_co_id = 0;
+      ora_co_id_ind = -1;
+    }
+
+  ora_ohxact = ppstInvInfo->solOhxact;
+  ora_amount_type_id = ppstServ->spstKey->solAmtTypeId;
+  ora_net_amount = ppstServ->sostVal.soflNetAmt;
+  ora_tax_amount = ppstServ->sostVal.soflTaxAmt;
+  
+  fovdPrintLog (LOG_DEBUG, "Insert: Inserting into EDS_BGH_LOYALTRAILER\n");    
+  fovdPrintLog (LOG_DEBUG, "OHXACT     : %ld\n", ora_ohxact);
+  fovdPrintLog (LOG_DEBUG, "Amount Type: %ld\n", ora_amount_type_id);
+  fovdPrintLog (LOG_DEBUG, "NetAmt     : %lf\n", ora_net_amount);
+  fovdPrintLog (LOG_DEBUG, "TaxAmt     : %lf\n", ora_tax_amount);
+  
+  EXEC SQL AT :O_db_name
+    INSERT INTO EDS_BGH_LOYALTRAILER 
+    ( 
+     OHXACT,
+     CO_ID,
+     AMOUNT_TYPE_ID,
+     NET_AMOUNT,
+     TAX_AMOUNT
+     )
+    VALUES
+    (
+     :ora_ohxact,
+     :ora_co_id:ora_co_id_ind,
+     :ora_amount_type_id,
+     round(:ora_net_amount, 2),
+     round(:ora_tax_amount, 2)
+     );  
+  
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not insert into EDS_BGH_LOYALTRAILER");
+      sqlerror(rc, message);
+      return rc;
+    }
+  
+  return rc;
+}
+
+int foiEdsBghLoyalChargeType_Load(struct tostLoyalCoServKeySeq **ppstSeq)
+{
+  int rc = 0;
+  int i;
+  struct tostLoyalCoServKeySeq *lpstSeq;
+  struct tostLoyalCoServKey *lpstKey;
+  
+  EXEC SQL BEGIN DECLARE SECTION;
+  long    ora_amount_type_id;
+  VARCHAR ora_subtype[5];
+  long    ora_sncode;
+  long    ora_zncode;
+  VARCHAR ora_lin7140[35];
+  VARCHAR ora_pia7140[35];
+  VARCHAR ora_des[80];
+  EXEC SQL END DECLARE SECTION;
+
+  EXEC SQL AT :O_db_name
+    DECLARE C_loyal_charge_type CURSOR FOR
+     SELECT AMOUNT_TYPE_ID, 
+            SHDES,
+            LIN7140,
+            PIA7140,
+            DES
+       FROM EDS_BGH_LOYAL_CHARGE_TYPE
+      WHERE AMOUNT_TYPE_ID > 0
+   ORDER BY AMOUNT_TYPE_ID;
+
+  *ppstSeq = NULL;
+  
+  /* open cursor for EDS_BGH_LOYAL_CHARGE_TYPE with desc sorting */  
+  EXEC SQL AT :O_db_name 
+    OPEN C_loyal_charge_type;
+  
+  if (sqlca.sqlcode != 0)
+    {
+      sprintf(message, "%s\n", "Can't open cursor for EDS_BGH_LOYAL_CHARGE_TYPE");
+      sqlerror(sqlca.sqlcode, message);
+      rc = -1;
+    }
+  else
+    {
+      fovdPrintLog (LOG_DEBUG, "Opened cursor for EDS_BGH_LOYAL_CHARGE_TYPE\n");    
+    }
+
+  /* fetch next record */
+  if (rc == 0)
+    {
+      for (i = 0;; i++)
+        {
+          EXEC SQL AT :O_db_name 
+            FETCH C_loyal_charge_type 
+            INTO  :ora_amount_type_id,
+                  :ora_subtype,
+                  :ora_lin7140,
+                  :ora_pia7140,
+                  :ora_des;
+
+          if (sqlca.sqlcode < 0)
+            {
+              sprintf(message, "%s\n", "Can't fetch cursor for EDS_BGH_LOYAL_CHARGE_TYPE");
+              sqlerror(sqlca.sqlcode, message);
+              rc = -1;
+              break;
+            }
+          else if (sqlca.sqlcode == 1403)
+            {
+              break;
+            }
+          else
+            {
+              /* create and fill record */
+              lpstKey = (struct tostLoyalCoServKey *)malloc(sizeof(struct tostLoyalCoServKey));
+              if (lpstKey == NULL)
+                {
+                  rc = -1;
+                  break;
+                }
+              else
+                {
+                  memset(lpstKey, 0x00, sizeof(struct tostLoyalCoServKey));
+                  
+                  lpstKey->solAmtTypeId = ora_amount_type_id;                  
+                  memcpy(lpstKey->saszSubType, ora_subtype.arr, ora_subtype.len);
+                  if (ora_lin7140.len > 0)
+                    {
+                      memcpy(lpstKey->saszLin7140, ora_lin7140.arr, ora_lin7140.len);
+                    }
+
+                  if (ora_pia7140.len > 0)
+                    {
+                      memcpy(lpstKey->saszPia7140, ora_pia7140.arr, ora_pia7140.len);
+                    }
+
+                  if (ora_des.len > 0)
+                    {
+                      memcpy(lpstKey->saszDes, ora_des.arr, ora_des.len);
+                    }
+                  
+                  fovdPrintLog (LOG_DEBUG, 
+                                "Fetch: [%d] %ld %5.5s %s %s %s\n",
+                                i,
+                                lpstKey->solAmtTypeId,
+                                lpstKey->saszSubType,
+                                lpstKey->saszLin7140,
+                                lpstKey->saszPia7140,
+                                lpstKey->saszDes);
+                }
+              
+              /* create node, add record to the list */
+              lpstSeq = (struct tostLoyalCoServKeySeq *)malloc(sizeof(struct tostLoyalCoServKeySeq));
+              if (lpstSeq == NULL)
+                {
+                  rc = -1;
+                  break;
+                }
+              else
+                {
+                  lpstSeq->spstKey = lpstKey;
+                  lpstSeq->spstNext = *ppstSeq;
+                  *ppstSeq = lpstSeq;
+                }
+            }
+        } /* for */
+    }
+
+  /* close cursor */
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name 
+        CLOSE C_loyal_charge_type;
+      
+      if (sqlca.sqlcode != 0)
+        {
+          sprintf(message, "%s\n", "Can't close cursor for EDS_BGH_LOYAL_CHARGE_TYPE");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+      else
+        {
+          fovdPrintLog (LOG_DEBUG, "Closed cursor for EDS_BGH_LOYAL_CHARGE_TYPE\n");    
+        }
+    }
+
+  return rc;
+}
+
+int foiEdsBghLoyal_Clean(struct tostLoyalInvInfo *ppstInfo)
+{
+  int rc = 0;
+
+  EXEC SQL BEGIN DECLARE SECTION;
+  long     ora_ohxact;
+  EXEC SQL END DECLARE SECTION;
+
+  ora_ohxact = ppstInfo->solOhxact;
+  
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name
+        DELETE FROM EDS_BGH_LOYALTRAILER
+        WHERE OHXACT = :ora_ohxact;  
+
+      if (sqlca.sqlcode < 0)
+        {
+          sprintf(message, "%s\n", "Can't delete from EDS_BGH_LOYALTRAILER");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+    }
+
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name
+        DELETE FROM EDS_BGH_LOYAL_CONTRACT
+        WHERE OHXACT = :ora_ohxact;
+      
+      if (sqlca.sqlcode < 0)
+        {
+          sprintf(message, "%s\n", "Can't delete from EDS_BGH_LOYALCONTRACT");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+    }
+
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name
+        DELETE FROM EDS_BGH_LOYALHDR
+        WHERE OHXACT = :ora_ohxact;
+
+      if (sqlca.sqlcode < 0)
+        {
+          sprintf(message, "%s\n", "Can't delete from EDS_BGH_LOYALHDR");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+    }
+
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name
+        DELETE FROM EDS_VATINVOTR
+        WHERE OTXACT = :ora_ohxact;
+
+      if (sqlca.sqlcode < 0)
+        {
+          sprintf(message, "%s\n", "Can't delete from EDS_VATINVOTR");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+    }
+
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name
+        DELETE FROM EDS_VATINVTAX
+        WHERE OHXACT = :ora_ohxact;
+      
+      if (sqlca.sqlcode < 0)
+        {
+          sprintf(message, "%s\n", "Can't delete from EDS_VATINVTAX");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+    }
+
+  if (rc == 0)
+    {
+      EXEC SQL AT :O_db_name
+        DELETE FROM BILL_IMAGES
+        WHERE OHXACT = :ora_ohxact;
+
+      if (sqlca.sqlcode < 0)
+        {
+          sprintf(message, "%s\n", "Can't delete from BILL_IMAGES");
+          sqlerror(sqlca.sqlcode, message);
+          rc = -1;
+        }
+    }
+
+  return rc;
+}
+

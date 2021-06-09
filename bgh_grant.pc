@@ -1,0 +1,827 @@
+/**************************************************************************************************
+ *                                                                                          
+ * MODULE: GRANT
+ *                                                                                          
+ * AUTHOR: N.Bondarczuk                                                
+ * 
+ * CREATION DATE : 23.02.98
+ *
+ **************************************************************************************************
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>             /* used for strncmp          */
+#include <time.h>               /* time information          */
+
+#define SQLCA_STORAGE_CLASS extern
+#define ORACA_STORAGE_CLASS extern
+
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL INCLUDE oraca;
+EXEC ORACLE OPTION (INCLUDE=./include);
+EXEC ORACLE OPTION (INCLUDE=./ptk/include);
+
+#include "bgh.h"
+#include "protos.h"
+#include "bgh_esql.h"
+#include "types.h"
+#include "grant.h"
+
+#ifdef IN
+#undef IN
+#endif
+
+EXEC SQL BEGIN DECLARE SECTION;
+
+extern VARCHAR    O_db_name[50];
+extern VARCHAR    O_date_created[15]; /* DD-MM-YYYY */
+
+int O_count;
+
+VARCHAR O_ultag [MAX_ULFIELD_NAME_LEN];
+VARCHAR O_ulnff1[MAX_ULFIELD_NAME_LEN];
+VARCHAR O_ulnff2[MAX_ULFIELD_NAME_LEN];
+VARCHAR O_ulcff1[MAX_ULFIELD_NAME_LEN];
+VARCHAR O_ulcff2[MAX_ULFIELD_NAME_LEN];
+VARCHAR O_ulcff3[MAX_ULFIELD_NAME_LEN];
+
+VARCHAR O_field_1[MAX_INFO_FILED_LEN];
+VARCHAR O_field_2[MAX_INFO_FILED_LEN];
+VARCHAR O_field_3[MAX_INFO_FILED_LEN];
+
+short   O_field_1_ind;
+short   O_field_2_ind;
+short   O_field_3_ind;
+
+VARCHAR O_post_period[16];
+
+int     O_customer_id;
+VARCHAR O_ref_date[32];
+double  O_amount;
+double  O_inv_amount;
+int     O_caglcash;
+int     O_cagldis;
+int     O_cadglar;
+VARCHAR O_remark[80];
+VARCHAR O_user_name[16];
+int     O_reason_code;
+int     O_caxact;
+
+extern long O_ohxact;
+extern short O_ohxact_ind;           /* NULL indicator            */
+
+EXEC SQL END DECLARE SECTION;
+
+/*
+ * VARCHAR handling
+ */
+
+#define STRCPY_TO_ORA(dest, source)	\
+        {				\
+           (dest).len = strlen(source);	\
+           (void)memcpy((void*)(dest).arr, (void*)(source), (size_t)(dest).len); \
+	}
+#define STRCPY_FROM_ORA(dest, source)	\
+        { 				\
+          (void)memcpy((void*)(dest), (void*)(source).arr, (size_t)(source).len); \
+          (dest)[(source).len] = '\0';	\
+	}
+
+/*
+ * extern functions
+ */
+
+extern int foiTransx_Adjustment(long poilCustomerId,
+                                long poilGLXACT,
+                                long poilOHXACT,
+                                char *ppsnzEntryDate,
+                                char *ppsnzRefDate,
+                                double poflAdjumentAmount);
+
+/*
+ * extern variables
+ */
+
+extern stBGHGLOB stBgh;
+extern BOOL connected;     	       /* stores status of database      */
+extern BOOL status_single;           /* status for a single customer   */
+extern long current_customer_id;
+extern long current_contract_id;
+extern char current_date_created[15];
+
+/*
+ * static variables
+ */
+
+static char message[MAX_BUF];
+static tostGrantEnv dostGrantEnv;
+static tostGrantProfile **dapstProfileTab = NULL;
+static int doiProfileTabLen = 0;
+
+/**********************************************************************************************************************
+ *
+ * foiProfileCmp
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiProfileTabCmp(const void *ppvTblElmA, const void *ppvTblElmB)
+{
+  return ((tostGrantProfile *)ppvTblElmA)->soiCustomerId - ((tostGrantProfile *)ppvTblElmB)->soiCustomerId;
+}
+
+/**********************************************************************************************************************
+ *
+ * foenCheckDoubleFormat
+ *
+ **********************************************************************************************************************
+ */
+
+static toenBool foenCheckDoubleFormat(char *pasnzField)
+{
+  return TRUE;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiLoadProfiles
+ *
+ **********************************************************************************************************************
+ */
+
+#define MAX_QUERY_LEN 1000
+
+static int foiLoadProfiles()
+{
+  char lasnzSQLQuery[MAX_QUERY_LEN]; 
+  int loiPrgCode, loiCount, i, n, rc = 0;
+  char lasnzField[MAX_INFO_FILED_LEN];
+  tostGrantProfile *lpstProfile;
+  toenBool loenStatus;
+
+  loiPrgCode = dostGrantEnv.soiPriceGroup;
+  fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Price group is %d\n", loiPrgCode);
+  EXEC SQL AT :O_db_name
+    SELECT COUNT(*)
+    INTO :loiCount
+    FROM INFO_CUST_TEXT
+    WHERE CUSTOMER_ID IN (SELECT CUSTOMER_ID FROM CUSTOMER_ALL WHERE PRGCODE = :loiPrgCode);
+  
+  if(sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;          
+      sprintf(message, "foiLoadProfiles: Error counting customers in PRG: %d", loiPrgCode);
+      sqlerror(rc, message);
+      return rc;
+    }
+  
+  fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Selected %d customers\n", loiCount);
+  if (loiCount == 0)
+    {
+      return rc;
+    }
+  
+  if ((dapstProfileTab = (tostGrantProfile **)calloc(loiCount, sizeof(tostGrantProfile *))) == NULL)
+    {
+      return -1;
+    }
+
+  sprintf(lasnzSQLQuery, 
+          "SELECT CUSTOMER_ID, %s, %s, %s FROM  INFO_CUST_TEXT WHERE CUSTOMER_ID IN (SELECT CUSTOMER_ID FROM CUSTOMER_ALL WHERE PRGCODE = %d)",
+          dostGrantEnv.sasnzExpDateFieldName,
+          dostGrantEnv.sasnzThresholdValFieldName,
+          dostGrantEnv.sasnzCalcFactorFieldName,
+          dostGrantEnv.soiPriceGroup);
+
+  fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Using SQL query: %s\n", lasnzSQLQuery);
+  
+  EXEC SQL AT :O_db_name 
+    PREPARE sql_statement FROM :lasnzSQLQuery;
+  
+  if(sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;          
+      sprintf(message, "foiLoadProfiles: Error preparing SQL statement");
+      sqlerror(rc, message);
+      return rc;
+    }
+  
+  EXEC SQL AT :O_db_name 
+    DECLARE sql_cursor CURSOR FOR sql_statement;
+
+  if(sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;          
+      sprintf(message, "foiLoadProfiles: Error declaring cursor");
+      sqlerror(rc, message);
+      return rc;
+    }
+  
+  EXEC SQL AT :O_db_name 
+    OPEN sql_cursor;
+
+  if(sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;          
+      sprintf(message, "foiLoadProfiles: Error opening SQL cursor");
+      sqlerror(rc, message);
+      return rc;
+    }
+  
+  for (i = 0; i < loiCount; i++)
+    {
+      EXEC SQL AT :O_db_name 
+        FETCH sql_cursor INTO :O_customer_id, :O_field_1:O_field_1_ind, :O_field_2:O_field_2_ind, :O_field_3:O_field_3_ind;
+      
+      if(sqlca.sqlcode != 0)
+        {
+          rc = sqlca.sqlcode;          
+          sprintf(message, "foiLoadProfiles: Error fetching from SQL cursor");
+          sqlerror(rc, message);
+          break;
+        }
+
+      fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Fetched customer no: %d\n", i + 1);
+      
+      if ((lpstProfile = (tostGrantProfile *)malloc(sizeof(tostGrantProfile))) == NULL)
+        {
+          return -1;
+        }
+
+      lpstProfile->soenValid = TRUE;
+      lpstProfile->soiCustomerId = O_customer_id;
+
+      /*
+       * Prepare field 1
+       */
+
+      if (O_field_1_ind != -1)
+        {
+          STRCPY_FROM_ORA(lasnzField, O_field_1);
+          strncpy(lpstProfile->sasnzExpDate, lasnzField, MAX_EXP_DATE_LEN);
+        }
+      else
+        {
+          lpstProfile->soenValid = FALSE;
+        }
+
+      /*
+       * Prepare field 2
+       */
+
+      if (O_field_2_ind != -1 && lpstProfile->soenValid == TRUE)
+        {
+          STRCPY_FROM_ORA(lasnzField, O_field_2);
+          if ((loenStatus = foenCheckDoubleFormat(lasnzField)) == TRUE)
+            {
+              if ((n = sscanf(lasnzField, "%lf", &(lpstProfile->soflThresholdVal))) == 0)
+                {
+                  lpstProfile->soenValid = FALSE;
+                }
+            }
+          else
+            {
+              lpstProfile->soenValid = FALSE;
+            }
+        }
+      else
+        {
+          lpstProfile->soenValid = FALSE;
+        }
+
+      /*
+       * Prepare field 3
+       */
+
+      if (O_field_3_ind != -1 && lpstProfile->soenValid == TRUE)
+        {
+          STRCPY_FROM_ORA(lasnzField, O_field_3);
+          if ((loenStatus = foenCheckDoubleFormat(lasnzField)) == TRUE)
+            {          
+              if ((n = sscanf(lasnzField, "%lf", &(lpstProfile->soflCalcFactor))) == 0)
+                {
+                  lpstProfile->soenValid = FALSE;
+                }
+            }
+          else
+            {
+              lpstProfile->soenValid = FALSE;
+            }
+        }
+      else
+        {
+          lpstProfile->soenValid = FALSE;
+        }
+
+      if (lpstProfile->soenValid == TRUE)
+        {
+          fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Profile no: %d is: %s, %lf, %lf\n", 
+                        i + 1, 
+                        lpstProfile->sasnzExpDate, 
+                        lpstProfile->soflThresholdVal, 
+                        lpstProfile->soflCalcFactor);
+        }
+      else
+        {
+          fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Invalid profile for customer no: %d\n", i + 1);          
+        }
+      
+      dapstProfileTab[i] = lpstProfile;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Loaded %d profiles\n", i);          
+
+  if (i != loiCount)
+    {
+      return -1;
+    }
+  else
+    {
+      doiProfileTabLen = i;
+    }
+
+  EXEC SQL AT :O_db_name
+    CLOSE sql_cursor;
+
+  if(sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;          
+      sprintf(message, "foiLoadProfiles: Error closing SQL cursor");
+      sqlerror(rc, message);      
+    }
+  
+  /*
+   * Sorting of table of grant customers by the value of customer id
+   */
+
+  fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Sorting profiles\n");  
+  if (rc == 0 && dapstProfileTab != NULL)
+    {
+      qsort((void *)dapstProfileTab, doiProfileTabLen, sizeof(tostGrantProfile *), foiProfileTabCmp);
+      fovdPrintLog (LOG_DEBUG, "foiLoadProfiles: Profiles sorted\n");  
+    }
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiGrant_LoadConfig
+ *
+ **********************************************************************************************************************
+ */
+
+int foiGrant_LoadConfig()
+{
+  int rc = 0, n;
+  char lasnzStr[MAX_ULFIELD_NAME_LEN];
+
+  memset((void *)&dostGrantEnv, 0x00, sizeof(tostGrantEnv));
+
+  /*
+   * GRANT_ENV_LABEL
+   */
+
+  STRCPY_TO_ORA(O_ultag, GRANT_ENV_LABEL);
+  
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Loading info for %s\n", GRANT_ENV_LABEL);
+  EXEC SQL AT :O_db_name
+    SELECT ulnff1, ulcff1, ulcff2, ulcff3
+    INTO :O_ulnff1, :O_ulcff1, :O_ulcff2, :O_ulcff3
+    FROM USERLBL
+    WHERE ULTAG = :O_ultag;
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not load config data from USERLBL table");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  /*
+   * Scope 1
+   */
+
+  STRCPY_FROM_ORA(lasnzStr, O_ulnff1);
+  if ((n = sscanf(lasnzStr, "%d", &dostGrantEnv.soiPriceGroup)) == 0)
+    {
+      return -1;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Price group: %d\n", dostGrantEnv.soiPriceGroup);
+
+  /*
+   * Scope 2
+   */
+
+  STRCPY_FROM_ORA(dostGrantEnv.sasnzExpDateFieldName, O_ulcff1);
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Ex dat fld : %s\n", dostGrantEnv.sasnzExpDateFieldName);
+  STRCPY_FROM_ORA(dostGrantEnv.sasnzThresholdValFieldName, O_ulcff2);
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Thr val fld: %s\n", dostGrantEnv.sasnzThresholdValFieldName);
+  STRCPY_FROM_ORA(dostGrantEnv.sasnzCalcFactorFieldName, O_ulcff3);
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Cal fac fld: %s\n", dostGrantEnv.sasnzCalcFactorFieldName);
+
+  /*
+   * GRANT_GL_LABEL
+   */
+  
+  STRCPY_TO_ORA(O_ultag, GRANT_GL_LABEL);
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Loading info for %s\n", GRANT_GL_LABEL);
+  EXEC SQL AT :O_db_name
+    SELECT ulcff1, ulcff2, ulnff1
+    INTO :O_ulcff1, :O_ulcff2, :O_ulnff1
+    FROM USERLBL
+    WHERE ULTAG = :O_ultag;
+
+  /*
+   * Scope 3
+   */
+
+  STRCPY_FROM_ORA(lasnzStr, O_ulcff1);
+  if ((n = sscanf(lasnzStr, "%d", &dostGrantEnv.soiGLCash)) == 0)
+    {
+      return -1;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: GL Cash Acc: %d\n", dostGrantEnv.soiGLCash);
+  
+  STRCPY_FROM_ORA(lasnzStr, O_ulcff2);
+  if ((n = sscanf(lasnzStr, "%d", &dostGrantEnv.soiGLDis)) == 0)
+    {
+      return -1;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: GL Disc Acc: %d\n", dostGrantEnv.soiGLDis);
+
+  STRCPY_FROM_ORA(lasnzStr, O_ulnff1);
+  if ((n = sscanf(lasnzStr, "%d", &dostGrantEnv.soiReasonCode)) == 0)
+    {
+      return -1;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Reason code: %d\n", dostGrantEnv.soiReasonCode);
+
+  /*
+   * Get default posting period
+   */
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Loading current posting period\n");
+  EXEC SQL AT :O_db_name
+    SELECT PPPERIOD
+    INTO :O_post_period
+    FROM POSTPERIOD_ALL
+    WHERE PPARCURMTH = 'C';
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not load current posting period");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  memcpy(dostGrantEnv.sasnzPostPeriod, (char *)O_post_period.arr, O_post_period.len);  
+  fovdPrintLog (LOG_DEBUG, "foiGrant_LoadConfig: Posting period: %s\n", dostGrantEnv.sasnzPostPeriod);
+
+  /*
+   * When the pricegroup is known then customer profiles may be loaded
+   */
+
+  if ((rc = foiLoadProfiles()) != 0)
+    {
+      return rc;
+    }
+  
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foenGrant_Check
+ *
+ **********************************************************************************************************************
+ */
+
+toenBool foenGrant_Check(int poiPriceGroup)
+{
+  /*
+   * No profiles were loaded
+   */
+
+  if (dapstProfileTab == NULL)
+    {
+      return FALSE;
+    }
+  
+  if (poiPriceGroup == dostGrantEnv.soiPriceGroup)
+    {
+      return TRUE;
+    }
+  
+  return FALSE;
+}
+
+toenBool foenGrant_IsValid(int poiPriceGroup, int poiCustomerId)
+{
+  int i;
+  tostGrantProfile *lpstProfile = NULL;  
+
+  if (dapstProfileTab == NULL)
+    {
+      /*
+       * No granting used
+       */
+
+      return TRUE;
+    }
+  
+  if (poiPriceGroup != dostGrantEnv.soiPriceGroup)
+    {
+      /*
+       * Not a Granting price group
+       */
+
+      return TRUE;
+    }
+  
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Searching customer: %d\n", poiCustomerId);  
+  for (i = 0; i < doiProfileTabLen; i++)
+    {
+      fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Testing: %d\n", i);  
+      if (dapstProfileTab[i]->soiCustomerId == poiCustomerId)
+        {
+          lpstProfile = dapstProfileTab[i];
+          break;
+        }
+    }
+
+  if (lpstProfile == NULL)
+    {
+      /*
+       * GRANT price group but no customer data defined
+       */
+      
+      return FALSE;
+    }
+  
+  return lpstProfile->soenValid;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiGrant_Assign
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiProfileTabSrchCmp(const void *ppvTblElmA, const void *ppvTblElmB)
+{
+  return *((int *)ppvTblElmA) - ((tostGrantProfile *)ppvTblElmB)->soiCustomerId;
+}
+
+int foiGrant_Assign(int poiCustomerId, char *ppsnzSettlPerEndDate, double *ppflBGHInvAmount)
+{
+  tostGrantProfile *lpstProfile = NULL;  
+  double loflDiscInvAmount;
+  char lasnzEntryDate[32], lasnzRefDate[32];
+  int i, rc = 0;
+
+  /*
+   * Look for customer's profile in the sorted table of profiles
+   */
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Searching customer: %d\n", poiCustomerId);  
+  for (i = 0; i < doiProfileTabLen; i++)
+    {
+      fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Testing: %d\n", i);  
+      if (dapstProfileTab[i]->soiCustomerId == poiCustomerId)
+        {
+          lpstProfile = dapstProfileTab[i];
+          break;
+        }
+    }
+
+  if (lpstProfile == NULL)
+    {
+      return -1;
+    }
+
+  /*
+  if ((lpstProfile = bsearch(&poiCustomerId, 
+                             dapstProfileTab, 
+                             doiProfileTabLen, 
+                             sizeof(tostGrantProfile *), 
+                             foiProfileTabSrchCmp)) == NULL)
+    {
+      return -1;
+    }
+  */
+
+  if (lpstProfile->soenValid == FALSE)
+    {
+      return -1;
+    }
+
+  /*
+   * Calculate granting discount function value
+   */
+
+  if (*ppflBGHInvAmount >= lpstProfile->soflThresholdVal)
+    {
+      loflDiscInvAmount = lpstProfile->soflThresholdVal * lpstProfile->soflCalcFactor;
+      loflDiscInvAmount += *ppflBGHInvAmount - lpstProfile->soflThresholdVal; 
+    }
+  else
+    {
+      loflDiscInvAmount = 0.0;
+      loflDiscInvAmount = *ppflBGHInvAmount * lpstProfile->soflCalcFactor;    
+    }
+
+  /*
+   * Create adjustment in BSCS
+   */
+
+  if (O_ohxact_ind == -1)
+    {
+      *ppflBGHInvAmount = loflDiscInvAmount;
+      return rc;
+    }
+
+  O_customer_id = poiCustomerId;
+  STRCPY_TO_ORA(O_ref_date, ppsnzSettlPerEndDate);
+  O_amount = *ppflBGHInvAmount - loflDiscInvAmount;
+  O_inv_amount = *ppflBGHInvAmount;
+  O_caglcash = dostGrantEnv.soiGLCash;
+  O_cagldis = dostGrantEnv.soiGLDis;
+  O_cadglar = O_ohxact;
+  STRCPY_TO_ORA(O_remark, "Grant");
+  strcpy((char *)O_post_period.arr, dostGrantEnv.sasnzPostPeriod);
+  O_post_period.len = strlen(dostGrantEnv.sasnzPostPeriod);
+  STRCPY_TO_ORA(O_user_name, "BGH");
+  O_reason_code = dostGrantEnv.soiReasonCode;
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: changing customer's balance\n");  
+  EXEC SQL AT :O_db_name
+    UPDATE SYSADM.CUSTOMER 
+    SET CSCURBALANCE = NVL(CSCURBALANCE, 0) - O_amount
+    WHERE CUSTOMER_ID = O_customer_id;
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not change balance of the account");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Locking maxvalue for MAX_CAXACT\n");  
+  EXEC SQL AT :O_db_name
+    SELECT VALUE 
+    INTO O_caxact 
+    FROM MAXVALUE 
+    WHERE VALUE_ID = 'MAX_CAXACT'
+    FOR UPDATE;
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not get the max value for MAX_CAXACT");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Increasing maxvalue for MAX_CAXACT\n");  
+  EXEC SQL AT :O_db_name
+    UPDATE MAXVALUE 
+    SET VALUE = VALUE + 1
+    WHERE VALUE_ID = 'MAX_CAXACT';
+  
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not increase the max value for MAX_CAXACT");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Inserting into CASHRECEIPTS\n");  
+  EXEC SQL AT :O_db_name
+    INSERT INTO CASHRECEIPTS (CUSTOMER_ID,
+                              CAENTDATE,
+                              CARECDATE,
+                              CAXACT,
+                              CAPP,
+                              CACHKNUM,
+                              CACHKDATE,
+                              CACHKAMT,
+                              CAGLCASH,
+                              CADISAMT,
+                              CAGLDIS,
+                              CATYPE,
+                              CABATCH,
+                              CAREM,
+                              CAMOD,  
+                              CABANKNAME, 
+                              CABANKACC, 
+                              CABANKSUBACC, 
+                              CAUSERNAME, 
+                              CAJOBCOST, 
+                              REC_VERSION, 
+                              CAREASONCODE, 
+                              CACURAMT)
+    VALUES (O_customer_id,
+            TO_DATE(O_ref_date, 'yyyymmdd'),
+            TO_DATE(O_ref_date, 'yyyymmdd'),
+            O_caxact,
+            O_post_period,
+            NULL,
+            TO_DATE(O_ref_date, 'yyyymmdd'), 
+            O_amount,
+            O_caglcash,
+            0.0,
+            O_cagldis,
+            9,
+            0,
+            'Grant',
+            'X',  
+            NULL, 
+            NULL, 
+            NULL, 
+            O_user_name, 
+            NULL, 
+            1, 
+            O_reason_code, 
+            O_amount);
+
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not create cash entry");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Inserting into CASHDETAIL\n");    
+  EXEC SQL AT :O_db_name
+    INSERT INTO CASHDETAIL (CADXACT, 
+                            CADOXACT, 
+                            CADAMT,
+                            CADGLAR, 
+                            REC_VERSION, 
+                            CADASSOCXACT)  
+    VALUES (O_caxact, 
+            O_ohxact, 
+            0,
+            O_cadglar, 
+            1, 
+            O_ohxact);  
+  
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not create cash - invoice link");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  fovdPrintLog (LOG_DEBUG, "foiGrant_Assign: Updating ORDERHDR_ALL\n");  
+  EXEC SQL AT :O_db_name
+    UPDATE ORDERHDR_ALL
+    SET OHOPNAMT = OHOPNAMT - O_amount
+    WHERE OHXACT = O_ohxact;
+  
+  if (sqlca.sqlcode != 0)
+    {
+      rc = sqlca.sqlcode;
+      sprintf(message, "%s\n", "Could not change open amount of the invoice");
+      sqlerror(rc, message);
+      return rc;
+    }
+
+  *ppflBGHInvAmount = loflDiscInvAmount;
+
+  return rc;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

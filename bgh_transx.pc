@@ -1,0 +1,1108 @@
+/**************************************************************************************************
+ *                                                                                          
+ * MODULE: BGH_TRANSX
+ *                                                                                          
+ * AUTHOR: N.Bondarczuk                                                
+ * 
+ * CREATION DATE : 23.02.98
+ *
+ **************************************************************************************************
+ */
+
+#define _BGH_TRANSX_
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>             /* used for strncmp          */
+#include <time.h>               /* time information          */
+
+#define SQLCA_STORAGE_CLASS extern
+#define ORACA_STORAGE_CLASS extern
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL INCLUDE oraca;
+EXEC ORACLE OPTION (INCLUDE=./include);
+
+#include "bgh.h"
+#include "protos.h"
+#include "bgh_esql.h"
+#include "bgh_transx.h"
+#include "parser.h"
+#include "timm.h"
+#include "gen.h"
+
+/*
+ * VARCHAR handling
+ */
+
+#define STRCPY_TO_ORA(dest, source)	\
+        {				\
+           (dest).len = strlen(source);	\
+           (void)memcpy((void*)(dest).arr, (void*)(source), (size_t)(dest).len); \
+	}
+#define STRCPY_FROM_ORA(dest, source)	\
+        { 				\
+          (void)memcpy((void*)(dest), (void*)(source).arr, (size_t)(source).len); \
+          (dest)[(source).len] = '\0';	\
+	}
+
+/*
+ * extern variables
+ */
+
+extern stBGHGLOB stBgh;
+extern BOOL connected;     	    /* stores status of database      */
+extern BOOL status_single;        /* status for a single customer   */
+extern long current_customer_id;
+extern long current_contract_id;
+extern char current_date_created[15];
+extern long O_ohxact;
+
+EXEC SQL BEGIN DECLARE SECTION;
+
+extern VARCHAR O_db_name[50];
+
+EXEC SQL END DECLARE SECTION;
+
+/*
+ * static variables
+ */
+
+static char message[MAX_BUF];
+
+/*
+ * static functions
+ */
+
+static int foiHostArr2Seq(int poiRowsNum, 
+                          O_ordertrailer_arr *ppstArr, 
+                          struct tostOtEntrySeq **pppstOtEntrySeq);
+
+static int foiRecodeOtName2Edi(char *laszTargetOtName,
+                               char *laszSourceOtName,
+                               int poiOtNameBufLen);
+
+static int foiMapCode2Shdes(char *ppszCode, 
+                            enum toenServMapType t, 
+                            char **pppszShdes);
+
+static int foiServMapTree_Load(enum toenServMapType t, 
+                               struct tostServMapTree **pppstTree);
+
+static int foiServMapTree_Find(struct tostServMapTree **pppstTree,
+                               int poiCode, 
+                               char **pppszShdes);
+
+static int foiOtEntrySeq_EdiMatch(struct tostOtEntrySeq *ppstOtEntrySeq,
+                                  struct s_group_22 *ppstG22);
+
+#define MAX_SQL_MESSAGE 512
+
+static void sqlerror(
+                     int code,         /* self-defined error-code   */
+                     char *occurrence  /* location where the error  */
+                     )                  /* occurred and additional   */  
+{
+/* These vars are only used to get the oracle long-message   */
+  char message_buf[ MAX_SQL_MESSAGE + 1];
+  size_t buf_len = MAX_SQL_MESSAGE;
+  size_t msg_len;
+  
+  if (sqlca.sqlcode < 0) 
+    {
+      /* to get the oracle long-message */
+      sqlglm (message_buf , &buf_len, &msg_len); /* sqlglm is a ORACLE function */
+      message_buf[msg_len] = '\0';
+      sprintf(message, "%s%s\n%s%d\n%s%ld\n%s%s\n%s%s",
+              "SQL-ERROR in file: ", __FILE__,
+              "Module ERROR-code: ", code,
+              "SQL-code:          ", sqlca.sqlcode,
+              "Description:       ", occurrence,
+              "SQL-Full message:  ", message_buf);
+            
+      macErrorMessage (code, WARNING, message);
+    }
+}
+
+/**********************************************************************************************************************
+ *
+ * foiTransx_RoundOHEntry
+ *
+ **********************************************************************************************************************
+ */
+
+int foiTransx_RoundOHEntry(double poflTotalBrutAmount, 
+                           double poflBCH_TotalAmount)
+{
+  int rc = 0;
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiTransx_GetOtEntries
+ *
+ **********************************************************************************************************************
+ */
+
+int foiTransx_GetOtEntries(struct tostOtEntrySeq **pppstOtEntrySeq,
+                           stTIMM *ppstInv)
+{
+  int loiRetNum = 0;
+  int rc = 0;
+  int i;
+  
+  EXEC SQL BEGIN DECLARE SECTION;
+  
+  int O_count;
+  struct O_ordertrailer_arr O_ordertrailer_arr;
+  
+  EXEC SQL END DECLARE SECTION;
+
+  /* check */
+
+  EXEC SQL AT :O_db_name
+    SELECT COUNT(*) 
+    INTO :O_count
+    FROM ORDERHDR_ALL
+    WHERE OHXACT = :O_ohxact;
+
+  if (sqlca.sqlcode < 0)
+    {      
+      rc = -1;
+      sqlerror(rc, "Can't count ORDERHDR_ALL entries for actual OHXACT");      
+      return rc;
+    }
+
+  if (O_count == 0)
+    {
+      fovdPrintLog (LOG_CUSTOMER, "Can't get entries in ORDERHDR_ALL for invoice: %ld\n", O_ohxact);      
+      return rc;
+    }
+
+  /* load ORDERTRAILER from DB */
+  
+  EXEC SQL AT :O_db_name
+    DECLARE O_ordertrailer
+    CURSOR FOR
+    SELECT OTSEQ, OTNAME, OTMERCH, OTEXTTAX
+    FROM ORDERTRAILER
+    WHERE OTXACT = :O_ohxact;
+
+  fovdPrintLog (LOG_DEBUG, "Loading ORDERTRAILER for invoice: %ld\n", O_ohxact);
+  
+  EXEC SQL AT :O_db_name
+    OPEN O_ordertrailer;
+  
+  if (sqlca.sqlcode < 0)
+    {      
+      rc = -1;
+      sqlerror(rc, "Can't open ORDERTRAILER cursor");      
+    }
+
+  if (rc == 0)
+    {
+      for (i = 0; rc == 0; i++)
+        {
+          fovdPrintLog (LOG_DEBUG, "Fetching ORDERTRAILER record arr no: %d\n", i);
+
+          memset(&O_ordertrailer_arr, 0x00, sizeof(struct O_ordertrailer_arr));
+
+          EXEC SQL AT :O_db_name
+            FETCH O_ordertrailer
+            INTO :O_ordertrailer_arr;
+          
+          if (sqlca.sqlcode < 0)
+            {      
+              rc = -2;
+              sqlerror(rc, "Can't fetch from the ORDERTRAILER cursor");              
+              fovdPrintLog (LOG_CUSTOMER, "Can't fetch\n");
+            }
+          else
+            {
+              loiRetNum = sqlca.sqlerrd[2];
+              
+              fovdPrintLog (LOG_DEBUG, "Fetched ORDERTRAILER rows: %ld\n", loiRetNum);
+              
+              if ((rc = foiHostArr2Seq(loiRetNum, 
+                                       &O_ordertrailer_arr, 
+                                       pppstOtEntrySeq)) < 0)
+                {
+                  rc = -3;
+                  fovdPrintLog (LOG_CUSTOMER, 
+                                "Can't proc ORDERTRAILER arr for invoice: %ld\n", 
+                                O_ohxact);
+                }
+              else
+                {
+                  fovdPrintLog (LOG_DEBUG, 
+                                "Got rows %d, rc = %d\n",
+                                loiRetNum,
+                                rc);
+                  
+                  if (loiRetNum <= ARRAY_LEN)
+                    {
+                      fovdPrintLog (LOG_DEBUG, "No more rows than %d\n", loiRetNum);
+                      break;
+                    }
+                }
+            }
+        }      
+    }
+
+  if (rc == 0)
+    {
+      fovdPrintLog (LOG_DEBUG, "Closing ORDERTRAILER cursor\n");     
+
+      EXEC SQL AT :O_db_name
+        CLOSE O_ordertrailer;
+
+      if (sqlca.sqlcode != 0)
+        {      
+          rc = -4;
+          sqlerror(rc, "Can't close the OORDERTRAILER cursor");
+        }
+    }
+
+  /* match entries from ORDERTRAILER with EDI G22 items */
+
+  if (rc == 0)
+    {
+      fovdPrintLog (LOG_DEBUG, "Matching OTNAME entries with TIMM\n");     
+
+      if ((rc = foiOtEntrySeq_EdiMatch(*pppstOtEntrySeq,
+                                       ppstInv->timm->g_22)) < 0)
+        {
+          rc = -5;
+          fovdPrintLog (LOG_CUSTOMER, "Can't match ORDERTRAILER with INV-TIMM for invoice: %ld\n", O_ohxact);
+        }
+    }
+      
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiHostArr2Seq
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiHostArr2Seq(int poiRowsNum, 
+                          O_ordertrailer_arr *ppstArr, 
+                          struct tostOtEntrySeq **pppstOtEntrySeq)
+{
+  int rc = 0;
+  int i;
+  struct tostOtEntrySeq *lpstSeq;
+
+  fovdPrintLog (LOG_DEBUG, "Loading from array of %d entries\n", poiRowsNum);
+
+  for (i = 0; i < poiRowsNum && rc == 0; i++)
+    {
+      if (NULL == (lpstSeq = malloc(sizeof(struct tostOtEntrySeq))))
+        {
+          rc = -1;
+          fovdPrintLog (LOG_CUSTOMER, "Can't malloc memory: %d bytes\n", sizeof(struct tostOtEntrySeq));
+        }
+      else
+        {
+          memset(lpstSeq, 0x00, sizeof(struct tostOtEntrySeq));
+          
+          lpstSeq->spstNext = *pppstOtEntrySeq;
+          *pppstOtEntrySeq = lpstSeq;
+          
+          lpstSeq->sostOtEntry.soiOtSeq = ppstArr->O_otseq[i];
+          lpstSeq->sostOtEntry.soflOtGross = ppstArr->O_otmerch[i] + ppstArr->O_otexttax[i];
+
+          /* must handle amount for Round Diff */
+          lpstSeq->sostOtEntry.soflOtNet = ppstArr->O_otmerch[i];
+          lpstSeq->sostOtEntry.soflOtDis = 0.0;
+
+          /* recode OTNAME to the format of EDI */
+          if ((rc = foiRecodeOtName2Edi(lpstSeq->sostOtEntry.saszOtName,
+                                        ppstArr->O_otname[i],                                 
+                                        OTNAME_MAX_LEN)) < 0)
+            {
+              rc = -2;
+              fovdPrintLog (LOG_CUSTOMER, "Can't recode %dth otname: %s\n", i, ppstArr->O_otname[i]);
+            }
+        }
+    }
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiRecodeOtName2Edi
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiRecodeOtName2Edi(char *laszEdiOtName, 
+                               char *paszOtrOtName,
+                               int poiOtNameBufLen)
+{
+  int rc = 0;  
+  int i;
+  enum toenServMapType t;
+  char *lpszSep;
+  char *lpszShdes;
+  char *lpszTerm;
+  char *laszTermTab[TERM_TAB_LEN];
+  int loiStrLen;
+  int loiTabLen;
+  char *lpszPtr;
+  static char laszOtrOtName[100];
+
+  memset(laszOtrOtName, 0x00, 100);
+  strncpy(laszOtrOtName, paszOtrOtName, 100);  
+  for (i = 0; i < 100; i++)
+    {
+      if (laszOtrOtName[i] == ' ')
+        {
+          laszOtrOtName[i] = 0x00;
+        }
+    }
+
+  fovdPrintLog (LOG_DEBUG, "Recoding otname: %s\n", laszOtrOtName);
+
+  /* Rounding Difference row */
+
+  if (0 == memcmp(laszOtrOtName, "Rounding", strlen("Rounding")))
+    {
+      fovdPrintLog (LOG_DEBUG, "Rounding difference otname: %s\n", paszOtrOtName);
+      strcpy(laszEdiOtName, paszOtrOtName);
+      
+      return rc;
+    }
+
+  /* not TM related OCC service */  
+
+  if (laszOtrOtName[0] == 'O')
+    {
+      fovdPrintLog (LOG_DEBUG, "Not TM related OCC service in otname: %s, no processing\n", paszOtrOtName);
+      strncpy(laszEdiOtName, laszOtrOtName, poiOtNameBufLen);
+
+      return rc;
+    }
+
+  /* fill table of strings */
+
+  i = 0;
+  lpszSep = ".";
+  lpszPtr = laszOtrOtName;
+  do {
+    
+    fovdPrintLog (LOG_DEBUG, "Proc segment %d of otname: %s\n", i, paszOtrOtName);
+
+    if (i == TERM_TAB_LEN)
+      {        
+        rc = -1;        
+        fovdPrintLog (LOG_CUSTOMER, "Too many dots %d in otname: %s\n", i, paszOtrOtName);
+      }
+    else if ((lpszTerm = strtok(lpszPtr, lpszSep)) != NULL)
+      {        
+        laszTermTab[i++] = lpszTerm;        
+        fovdPrintLog (LOG_DEBUG, "Got term: %s\n", lpszTerm);
+        lpszPtr = NULL;
+      }
+    else if (lpszPtr != NULL) /* parsing error */
+      {
+        rc = -2;
+        fovdPrintLog (LOG_CUSTOMER, "Parsing error in otname: %s\n", paszOtrOtName);
+      }
+    else
+      {
+        /* end */
+        fovdPrintLog (LOG_DEBUG, "End of parsing otname string\n");
+      }
+
+  } while (lpszTerm != NULL && rc == 0);
+
+  loiTabLen = i;
+  fovdPrintLog (LOG_CUSTOMER, "Entries found %d in otname: %s\n", loiTabLen, paszOtrOtName);
+  
+  /* use vocabulary - TM ralated service */
+  
+  for (i = 0; i < loiTabLen; i++)
+    {
+      if (i > 4) /* PIA */
+        {
+          if (laszTermTab[4][0] == 'U')
+            {
+              switch(i)
+                {
+                case 7: 
+                  if (laszTermTab[6][0] == 'R' 
+                      || laszTermTab[6][0] == 'r'
+                      || laszTermTab[6][0] == 'm')
+                    {
+                      t = PL;
+                    }
+                  break;
+                  
+                case 9: t = TT; break;
+                case 10: t = ZN; break;
+                default: t = UNDEFTYPE; break;
+                }
+            }
+          else
+            {
+              t = UNDEFTYPE;
+            }
+        }
+      else /* LIN */
+        {
+          switch(i)
+            {
+            case 0: t = TM; break;
+            case 1: t = UNDEFTYPE; break;
+            case 2: t = SP; break;
+            case 3: t = SN; break;
+            case 4: t = UNDEFTYPE; break;
+            default:t = UNDEFTYPE; break; 
+            }
+        }
+      
+      if (t != UNDEFTYPE)
+        {
+          fovdPrintLog (LOG_CUSTOMER, "Map term: %s type: %d to SHDES\n", laszTermTab[i], t);
+          
+          /* NULL means retrival */
+          lpszShdes = NULL;
+
+          if ((rc = foiMapCode2Shdes(laszTermTab[i], 
+                                     t,
+                                     &lpszShdes)) < 0)
+            {
+              rc = -4;
+              fovdPrintLog (LOG_CUSTOMER, "Can't map term: %s type: %d to SHDES\n", laszTermTab[i], t);
+            }
+          else
+            {
+              laszTermTab[i] = lpszShdes;
+            }
+        }          
+    }
+  
+  /* print table of recorded strings */
+      
+  for (loiStrLen = 0, i = 0; i < loiTabLen; i++)
+    {
+      if ((loiStrLen += (1 + strlen(laszTermTab[i]))) > poiOtNameBufLen)
+        {              
+          rc = -5;
+          fovdPrintLog (LOG_CUSTOMER, "Output otname buffer overflow\n");
+        }
+      else
+        {
+          if (i > 0)
+            {
+              strcat(laszEdiOtName, ".");
+            }
+          
+          strcat(laszEdiOtName, laszTermTab[i]);
+        }
+    }
+  
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiMapCode2Shdes
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiMapCode2Shdes(char *ppszCode, 
+                            enum toenServMapType t, 
+                            char **pppszShdes)
+{
+  int rc = 0;
+  char *lpszNewShdes = NULL;
+  static struct tostServMapTree *dapstTreeCache[] = 
+  {
+    NULL, /* MPUTMTAB */
+    NULL, /* MPUSPTAB */
+    NULL, /* MPUSNTAB */
+    NULL, /* MPDPLTAB */
+    NULL, /* MPUTTTAB */
+    NULL  /* MPUZNTAB */
+  };
+  
+  fovdPrintLog (LOG_DEBUG, "Mapping code %s in table no: %d\n", ppszCode, t);
+  
+  if (dapstTreeCache[t] == NULL)
+    {
+      fovdPrintLog (LOG_DEBUG, "Loding table no: %d\n", t);
+      
+      if ((rc = foiServMapTree_Load(t, &dapstTreeCache[t])) < 0)
+        {
+          rc = -1;
+          fovdPrintLog (LOG_CUSTOMER, "Can't load table no: %d\n", t);
+        }
+    }
+
+  if (rc == 0)
+    {
+      if ((rc = foiServMapTree_Find(&dapstTreeCache[t], 
+                                    atoi(ppszCode), 
+                                    &lpszNewShdes)) < 0)
+        {
+          rc = -2;
+          fovdPrintLog (LOG_CUSTOMER, "Can't map code %s in table no: %d\n", ppszCode, t);
+        }
+      else
+        {
+          *pppszShdes = lpszNewShdes;
+        }
+    }
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiServMapTree_Load
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiServMapTree_Load(enum toenServMapType t, 
+                               struct tostServMapTree **pppstTree)
+{
+  int rc = 0;
+  char *lpszShdes;
+  int i;
+
+  EXEC SQL BEGIN DECLARE SECTION;
+  
+  int O_code;
+  VARCHAR O_shdes[8];
+  
+  EXEC SQL END DECLARE SECTION;
+
+  fovdPrintLog (LOG_DEBUG, "Loading table no: %d\n", t);
+  
+  switch (t)
+    {
+    case TM: 
+      EXEC SQL AT :O_db_name
+        DECLARE C_tm CURSOR FOR
+        SELECT DISTINCT TMCODE, SHDES
+        FROM MPUTMTAB
+        WHERE TMCODE > 0 
+        AND STATUS = 'W';
+      break;
+      
+    case SP:
+      EXEC SQL AT :O_db_name
+        DECLARE C_sp CURSOR FOR
+        SELECT DISTINCT SPCODE, SHDES
+        FROM MPUSPTAB;
+      break;
+
+    case SN:
+      EXEC SQL AT :O_db_name
+        DECLARE C_sn CURSOR FOR
+        SELECT DISTINCT SNCODE, SHDES
+        FROM MPUSNTAB;
+      break;
+
+    case PL:
+      EXEC SQL AT :O_db_name
+        DECLARE C_pl CURSOR FOR
+        SELECT DISTINCT PLCODE, SHDES
+        FROM MPDPLTAB;
+      break;
+
+    case TT:
+      EXEC SQL AT :O_db_name
+        DECLARE C_tt CURSOR FOR
+        SELECT DISTINCT TTCODE, SHDES
+        FROM MPUTTTAB;
+      break;
+      
+    case ZN:
+      EXEC SQL AT :O_db_name
+        DECLARE C_zn CURSOR FOR
+        SELECT DISTINCT ZNCODE, SHDES
+        FROM MPUZNTAB;
+      break;
+
+    default:
+      rc = -1;
+      fovdPrintLog (LOG_CUSTOMER, "Incorrect table no: %d\n", t);
+    }
+
+  if (rc == 0)
+    {
+      fovdPrintLog (LOG_DEBUG, "Opening cursor no: %d\n", t);
+
+      switch (t)
+        {
+        case TM: 
+          EXEC SQL AT :O_db_name
+            OPEN C_tm;      
+          break;
+          
+        case SP:
+          EXEC SQL AT :O_db_name
+            OPEN C_sp;
+          break;
+          
+        case SN:
+          EXEC SQL AT :O_db_name
+            OPEN C_sn;
+          break;
+          
+        case PL:
+          EXEC SQL AT :O_db_name
+            OPEN C_pl;
+          break;
+          
+        case TT:
+          EXEC SQL AT :O_db_name
+            OPEN C_tt;
+          break;
+          
+        case ZN:
+          EXEC SQL AT :O_db_name
+            OPEN C_zn;
+          break;
+        }
+
+      if (sqlca.sqlcode < 0)
+        {
+          rc = -2;
+          fovdPrintLog (LOG_CUSTOMER, "Can't open cursor for table no: %d\n", t);
+        }
+    }
+
+  if (rc == 0)
+    {
+      for(i = 0; rc == 0; i++)
+        {
+          /*fovdPrintLog (LOG_DEBUG, "Fetching row %d from table no: %d\n", i, t);*/
+          
+          switch (t)
+            {
+            case TM: 
+              EXEC SQL AT :O_db_name
+                FETCH C_tm
+                INTO :O_code, :O_shdes;
+              break;
+              
+            case SP:
+              EXEC SQL AT :O_db_name
+                FETCH C_sp
+                INTO :O_code, :O_shdes;
+              break;
+              
+            case SN:
+              EXEC SQL AT :O_db_name
+                FETCH C_sn
+                INTO :O_code, :O_shdes;
+              break;
+              
+            case PL:
+              EXEC SQL AT :O_db_name
+                FETCH C_pl
+                INTO :O_code, :O_shdes;
+              break;
+              
+            case TT:
+              EXEC SQL AT :O_db_name
+                FETCH C_tt
+                INTO :O_code, :O_shdes;
+              break;
+              
+            case ZN:
+              EXEC SQL AT :O_db_name
+                FETCH C_zn
+                INTO :O_code, :O_shdes;
+              break;
+            }
+          
+          if (sqlca.sqlcode < 0)
+            {
+              rc = -3;
+              fovdPrintLog (LOG_CUSTOMER, "Can't fetch from cursor for table no: %d\n", t);
+            }
+          else if (sqlca.sqlcode == 1403)
+            {
+              /*fovdPrintLog (LOG_DEBUG, "Last row found, rc = %d\n", rc);*/
+              break;
+            }
+          else
+            {
+              /* record loaded */
+
+              /*fovdPrintLog (LOG_DEBUG, "Got record no: %d\n", i);*/
+              
+              if ((lpszShdes = (char *)malloc(O_shdes.len + 1)) == NULL)
+                {
+                  rc = -4;
+                  fovdPrintLog (LOG_CUSTOMER, "Can't malloc memory: %d bytes\n", O_shdes.len + 1);
+                }
+              else
+                {
+                  memset(lpszShdes, 0x00, O_shdes.len + 1);
+                  memcpy(lpszShdes, O_shdes.arr, O_shdes.len);
+
+                  if ((rc = foiServMapTree_Find(pppstTree, 
+                                                O_code,
+                                                &lpszShdes)) < 0)
+                    {
+                      rc = -5;
+                      fovdPrintLog (LOG_CUSTOMER, "Can't insert code: %d with shdes: %s\n", O_code, lpszShdes);
+                    }
+                  else
+                    {
+                      /*fovdPrintLog (LOG_DEBUG, "Mapping code: %d to shdes: %s\n", O_code, lpszShdes);*/
+                    }
+                }
+            }
+        }
+    }
+
+  if (rc == 0)
+    {
+      fovdPrintLog (LOG_DEBUG, "Closing cursor no: %d\n", t);
+
+      switch (t)
+        {
+        case TM: 
+          EXEC SQL AT :O_db_name
+            CLOSE C_tm;      
+          break;
+          
+        case SP:
+          EXEC SQL AT :O_db_name
+            CLOSE C_sp;
+          break;
+          
+        case SN:
+          EXEC SQL AT :O_db_name
+            CLOSE C_sn;
+          break;
+          
+        case PL:
+          EXEC SQL AT :O_db_name
+            CLOSE C_pl;
+          break;
+          
+        case TT:
+          EXEC SQL AT :O_db_name
+            CLOSE C_tt;
+          break;
+          
+        case ZN:
+          EXEC SQL AT :O_db_name
+            CLOSE C_zn;
+          break;
+        }
+
+      if (sqlca.sqlcode < 0)
+        {
+          rc = -6;
+          fovdPrintLog (LOG_CUSTOMER, "Can't close cursor for table no: %d\n", t);
+        }
+    }
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiServMapTree_Find
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiServMapTree_Find(struct tostServMapTree **pppstTree,
+                               int poiCode, 
+                               char **pppszShdes)
+{
+  int rc = 0;
+
+  if (*pppstTree == NULL)
+    {
+      if (*pppszShdes != NULL)
+        {
+          struct tostServMapTree *lpstTree;
+
+          /* add new entry SHDES mapped with CODE */
+          if ((lpstTree = (struct tostServMapTree *)malloc(sizeof(struct tostServMapTree))) == NULL)
+            {
+              rc = -1;
+              fovdPrintLog (LOG_CUSTOMER, "Can't malloc memory: %d bytes\n", sizeof(struct tostServMapTree));
+            }
+          else
+            {
+              /* filling tree node fields */
+              lpstTree->spstLeft = lpstTree->spstRight = NULL;
+              lpstTree->spszShdes = *pppszShdes;
+              lpstTree->soiCode = poiCode;
+              
+              /* adding new node to the tree */
+              *pppstTree = lpstTree;
+
+              /* new entry created */
+              rc = 0;
+            }
+        }
+      else
+        {
+          /* incorrect usage: invocation with invalid SHDES */          
+          rc = -2;
+          fovdPrintLog (LOG_CUSTOMER, "Incorrect usage, shdes is NULL when trying to add new node\n");
+        }
+    }
+  else
+    {
+      if (poiCode < (*pppstTree)->soiCode)
+        {
+          /* go left */
+          rc = foiServMapTree_Find(&((*pppstTree)->spstLeft), 
+                                   poiCode,
+                                   pppszShdes);
+        }
+      else if (poiCode > (*pppstTree)->soiCode)
+        {
+          /* go right */
+          rc = foiServMapTree_Find(&((*pppstTree)->spstLeft), 
+                                   poiCode,
+                                   pppszShdes);          
+        }
+      else
+        {
+          /* found SHDES mapped by CODE */
+          *pppszShdes = (*pppstTree)->spszShdes;
+          rc = 0;
+        }
+    }
+
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiTransx_SetOtEntryAttr
+ *
+ **********************************************************************************************************************
+ */
+
+int foiTransx_SetOtEntryAttr(char *ppszOtName, double poflDiscAmt)
+{
+  int rc = 0;
+  static char *dpszOtAttr = NULL;
+
+  /* must load attr. name to be updated from USERLBL */
+  if (dpszOtAttr == NULL)
+    {
+      EXEC SQL BEGIN DECLARE SECTION;
+      
+      int O_count;
+      VARCHAR O_ultag[18];
+      VARCHAR O_attr_name[40];
+
+      EXEC SQL END DECLARE SECTION;
+      
+      STRCPY_TO_ORA(O_ultag, DISC_ATTR_LABEL);
+      
+      EXEC SQL AT :O_db_name
+        SELECT COUNT(*)
+          INTO :O_count
+          FROM USERLBL
+         WHERE ULTAG = :O_ultag;
+
+      if (sqlca.sqlcode != 0)
+        {
+          rc = -1;
+        }
+      else if (O_count != 1)
+        {
+          rc = -2;
+        }
+      else /* no SQL error & 1 entry defined in USERLBL */
+        {
+          EXEC SQL AT :O_db_name
+            SELECT ULCFF1
+              INTO :O_attr_name
+              FROM USERLBL
+             WHERE ULTAG = :O_ultag;
+
+          if (sqlca.sqlcode != 0)
+            {
+              rc = -3;
+            }
+          else
+            {
+              if (NULL == (dpszOtAttr = malloc(O_ultag.len + 1)))
+                {
+                  rc = -4;
+                }
+              else
+                {
+                  (void)memcpy(dpszOtAttr, O_ultag.arr, O_ultag.len);
+                }
+            }
+        }
+    }
+
+  /* update ORDERTRAILER using Dyn SQL M2 */
+  if (rc == 0)
+    {
+      static char laszPattern[128];
+
+      EXEC SQL BEGIN DECLARE SECTION;
+            
+      static char O_update_stmt[256];
+
+      EXEC SQL END DECLARE SECTION;
+      
+      strcpy(laszPattern, "UPDATE ORDERTRAILER SET %s = %lf\n");
+      strcat(laszPattern, " WHERE OTXACT = :otxact\n");
+      strcat(laszPattern, "   AND OTNAME = :otname\n");
+      
+      sprintf(O_update_stmt, laszPattern, dpszOtAttr, poflDiscAmt, O_ohxact, ppszOtName);
+      
+      EXEC SQL AT :O_db_name
+        PREPARE sql_stmt
+        FROM :O_update_stmt;
+      
+      EXEC SQL AT :O_db_name
+        EXECUTE O_update_stmt
+        USING :O_ohxact, :ppszOtName;
+    }
+
+  /* return status */
+  return rc;
+}
+
+/**********************************************************************************************************************
+ *
+ * foiOtEntrySeq_EdiMatch
+ *
+ **********************************************************************************************************************
+ */
+
+static int foiOtEntrySeq_EdiMatch(struct tostOtEntrySeq *ppstOtEntrySeq,
+                                  struct s_group_22 *g_22)
+{
+  int rc = 0;
+  char laszOtStr[128];
+  struct s_moa_seg *moa;
+  struct tostOtEntrySeq *lpstSeq;
+  int n;
+  int i;
+  double loflGroAmt;
+  double loflDisAmt;
+  double loflNetAmt;
+
+  fovdPrintLog (LOG_DEBUG, "Matching OTNAME\n");
+
+  /* matche two sequences */
+  lpstSeq = ppstOtEntrySeq;
+  i = 0;
+  while (g_22 != NULL)
+    {
+      if (g_22->pia == NULL) /* no subarticle no */
+        {
+          sprintf(laszOtStr, "%s", g_22->lin->v_7140);
+        }
+      else /* usage item with subarticle number */
+        {
+          sprintf(laszOtStr, "%s.%s", g_22->lin->v_7140, g_22->pia->v_7140);
+        }
+
+      if (NULL == (moa = fpstFindPaymentSegment(g_22->g_23, "203", "5")))
+        {
+          rc = -1;
+          break;
+        }
+      else
+        {
+          n = sscanf(moa->v_5004, 
+                     "%lf",
+                     &loflGroAmt);
+          
+          ASSERT(n == 1);
+        }
+
+      if (NULL == (moa = fpstFindPaymentSegment(g_22->g_23, "919", "5")))
+        {
+          rc = -3;
+          break;
+        }
+      else
+        {
+          n = sscanf(moa->v_5004, 
+                     "%lf",
+                     &loflDisAmt);
+          
+          ASSERT(n == 1);
+        }
+
+      if (NULL == (moa = fpstFindPaymentSegment(g_22->g_23, "125", "5")))
+        {
+          rc = -2;
+          break;
+        }
+      else
+        {
+          n = sscanf(moa->v_5004, 
+                     "%lf", 
+                     &loflNetAmt);
+          
+          ASSERT(n == 1);
+        }
+      
+      if (EQ(laszOtStr, lpstSeq->sostOtEntry.saszOtName))
+        {
+          /* set dis & net amount */
+          
+          lpstSeq->sostOtEntry.soflOtDis = loflDisAmt;
+          
+          lpstSeq->sostOtEntry.soflOtNet = loflNetAmt;
+        }
+      else if (loflDisAmt != 0.0 && loflGroAmt == 0.0)
+        {
+          /* skip totally discounted item */
+        }
+      else
+        {
+          rc = -1;
+          break;
+        }
+
+      g_22 = g_22->g_22_next;
+      lpstSeq = lpstSeq->spstNext;              
+    }
+
+  /* check each item loaded from ORDRTRAILER */
+  lpstSeq = ppstOtEntrySeq;
+  i = 0;
+  while (lpstSeq != NULL)
+    {
+      fovdPrintLog (LOG_DEBUG, 
+                    "[%02d] OTTIMM: %40.40s\t%lf\t%lf\t%lf\n", 
+                    lpstSeq->sostOtEntry.soiOtSeq, 
+                    lpstSeq->sostOtEntry.saszOtName,
+                    lpstSeq->sostOtEntry.soflOtNet,
+                    lpstSeq->sostOtEntry.soflOtDis,
+                    lpstSeq->sostOtEntry.soflOtGross);
+      
+      i++;
+      lpstSeq = lpstSeq->spstNext;    
+    }
+
+
+  return rc;
+}
+
